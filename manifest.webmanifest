@@ -1,0 +1,25 @@
+{
+  "name": "Money Tracker",
+  "short_name": "Money",
+  "description": "Track income and spending across your bank accounts and credit cards. Data stays on your device.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f5f6f8",
+  "theme_color": "#2563eb",
+  "icons": [
+    {"src": "icon-192.png", "sizes": "192x192", "type": "image/png"},
+    {"src": "icon-512.png", "sizes": "512x512", "type": "image/png"},
+    {"src": "icon-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ],
+  "share_target": {
+    "action": "./",
+    "method": "GET",
+    "params": {"title": "share_title", "text": "share_text"}
+  },
+  "shortcuts": [
+    {"name": "Add transaction", "url": "./?action=add", "icons": [{"src": "icon-192.png", "sizes": "192x192"}]},
+    {"name": "Paste bank SMS", "url": "./?action=sms", "icons": [{"src": "icon-192.png", "sizes": "192x192"}]}
+  ]
+}
