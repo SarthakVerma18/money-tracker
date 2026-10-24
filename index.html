@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#2563eb">
+<meta name="color-scheme" content="light">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
 <title>Money Tracker</title>
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--text:#1c2230;--muted:#6b7280;--border:#e4e7ec;--accent:#2563eb;--accent-bg:#eaf1ff;--in:#15803d;--out:#c62828;--xfer:#7c3aed;--warn:#d97706;--shadow:0 1px 2px rgba(0,0,0,.05)}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1218;--card:#181c24;--text:#e6e8ee;--muted:#9aa3b2;--border:#2a303c;--accent:#60a5fa;--accent-bg:#1b2a44;--in:#4ade80;--out:#f87171;--xfer:#a78bfa;--warn:#fbbf24;--shadow:none}}
 *{box-sizing:border-box}
 body{margin:0;font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text)}
 .app{display:flex;min-height:100vh}
@@ -338,6 +338,8 @@ function vDashboard() {
   }
 
   const backupNudge = S.txns.length && (!S.lastBackup || Date.now() - S.lastBackup > 30 * 864e5);
+  if (NATIVE && !S.smsAuto) h += `<div class="note" style="margin-bottom:16px">📩 Let the app read your bank SMS so every GPay / UPI / card payment is added automatically. <button class="link" onclick="enableSms()">Turn on</button></div>`;
+  if ((S.pendingSms || []).length) h += `<div class="note" style="margin-bottom:16px">📩 ${S.pendingSms.length} SMS transactions need an account. <button class="link" onclick="openPending()">Review</button></div>`;
   if (backupNudge) h += `<div class="note" style="margin-bottom:16px">💾 Your data lives only in this browser. ${S.lastBackup ? 'Last backup was over 30 days ago.' : 'You haven\'t made a backup yet.'} <button class="link" onclick="backup()">Download a backup now</button></div>`;
 
   h += `<div class="grid g4">
@@ -661,7 +663,7 @@ function delTxn(id) {
 }
 
 /* ================= Bank SMS → transaction ================= */
-function parseSms(raw) {
+function parseSms(raw, received) {   // received: 'YYYY-MM-DD' the SMS arrived (optional)
   const s = String(raw || '').replace(/\s+/g, ' ').trim();
   if (!s || /\bOTP\b|one[- ]time password|verification code/i.test(s)) return null;
   if (/\b(will be (debited|charged)|is due|due date|minimum (amount|amt)|has requested|collect request|requested money|payment reminder)\b/i.test(s)) return null;
@@ -693,7 +695,8 @@ function parseSms(raw) {
     for (const dm of s.matchAll(new RegExp(re, 'g'))) if ((date = parseDate(dm[1]))) break;
     if (date) break;
   }
-  if (!date || date > today()) date = today();
+  const recv = received || today();
+  if (!date || date > recv || dayNum(recv) - dayNum(date) > 45) date = recv;
   // merchant / counterparty
   let who = null;
   const tries = [
@@ -708,6 +711,8 @@ function parseSms(raw) {
   }
   const desc = (who || s.slice(0, 60)).replace(/\s+/g, ' ').slice(0, 80);
   const t = {date, amount, dir, accountId, desc, notes: s, kind: 'normal', category: ''};
+  t._digits = digits[0] || '';
+  t._acctRef = !!digits.length || /\b(a\/c|acct|account|card)\b/i.test(s);
   const ac = autoCat({desc, dir}) || autoCat({desc: s, dir});
   if (ac) Object.assign(t, ac);
   if (accountId && acct(accountId).type === 'credit' && dir === 'in' && /payment|received/i.test(s) && !/refund|reversal|cashback/i.test(s)) Object.assign(t, {kind: 'transfer', category: ''});
@@ -737,12 +742,106 @@ function readSms() {
 function addSmsBatch() {
   let n = 0, miss = 0;
   document.querySelectorAll('.schk:checked').forEach(c => {
-    const t = {...window._sms[+c.dataset.n]}; delete t._dupOf;
+    const t = stripTmp(window._sms[+c.dataset.n]);
     t.accountId = document.querySelector(`.sacc[data-n="${c.dataset.n}"]`).value;
     if (!t.accountId) { miss++; return; }
     S.txns.push({id: uid(), created: Date.now() + n, ...t}); n++;
   });
   save(); closeModal(); render(); toast(`Added ${n}` + (miss ? ` · ${miss} skipped (no account chosen)` : ''));
+}
+function stripTmp(t) { const o = {}; for (const k in t) if (k[0] !== '_') o[k] = t[k]; return o; }
+
+/* ================= Automatic SMS reading (Android app only) ================= */
+const NATIVE = !!window.Android;
+function syncSms(quiet) {
+  if (!NATIVE || !S.smsAuto) return;
+  if (!Android.hasSmsPermission()) { S.smsAuto = false; save(); render(); toast('SMS permission is off — automatic reading paused', 'Fix', enableSms); return; }
+  let msgs;
+  try { msgs = JSON.parse(Android.readSms(String(S.smsLastTs || 0))); } catch (e) { console.error(e); return; }
+  let added = 0, pend = 0;
+  S.pendingSms = S.pendingSms || [];
+  for (const m of msgs) {
+    S.smsLastTs = Math.max(S.smsLastTs || 0, m.ts);
+    if (/^\+?\d{6,}$/.test(String(m.from).replace(/[\s-]/g, ''))) continue;   // from a personal phone number, not a bank
+    const t = parseSms(m.body, iso(new Date(m.ts)));
+    if (!t) continue;
+    if (!t.accountId) {
+      if (t._acctRef) { S.pendingSms.push({...stripTmp(t), _digits: t._digits, smsId: m.id}); pend++; }
+      continue;
+    }
+    // already recorded from a statement or by hand?
+    const dup = S.txns.find(x => x.accountId === t.accountId && x.dir === t.dir && x.src !== 'sms' && Math.abs(x.amount - t.amount) < 0.005 && Math.abs(dayNum(x.date) - dayNum(t.date)) <= 2);
+    if (dup) continue;
+    S.txns.push({id: uid(), created: m.ts, ...stripTmp(t), src: 'sms', smsId: m.id});
+    added++;
+  }
+  S.smsChecked = Date.now();
+  save();
+  if (added || pend) { render(); toast(`📩 ${added} new from SMS` + (pend ? ` · ${pend} need an account` : ''), pend ? 'Review' : null, openPending); }
+  else if (!quiet) { render(); toast('No new bank SMS'); }
+}
+function enableSms() {
+  if (Android.hasSmsPermission()) return startSms();
+  window.onSmsPermission = granted => {
+    if (granted) startSms();
+    else openModal(`<h2>SMS permission needed</h2>
+      <p>Android didn't grant SMS access. Because this app is installed from a file (not the Play Store), Android may hide the option until you allow it:</p>
+      <ol class="steps"><li>Tap <b>Open app settings</b> below.</li><li>Tap <b>⋮</b> (top-right) → <b>Allow restricted settings</b> (if you see it) and confirm.</li><li>Go to <b>Permissions → SMS → Allow</b>.</li><li>Come back here and tap <b>Turn on</b> again.</li></ol>
+      <div class="actions"><button class="btn" onclick="closeModal()">Close</button><button class="btn pri" onclick="Android.openAppSettings()">Open app settings</button></div>`);
+  };
+  Android.requestSmsPermission();
+}
+function startSms() {
+  const first = !S.smsLastTs;
+  let days = 0;
+  if (first) {
+    const v = prompt('Also read bank SMS already on your phone from the last how many days? (0 = only new ones from now on)', '60');
+    if (v === null) return;
+    days = Math.max(0, parseInt(v) || 0);
+    S.smsLastTs = Date.now() - days * 864e5;
+  }
+  S.smsAuto = true; save(); closeModal(); render();
+  syncSms(false);
+  if (!S.accounts.some(a => a.last4)) toast('Tip: add the last 4 digits to each account so SMS go to the right one', 'Accounts', () => go('accounts'));
+}
+function openPending() {
+  const P = S.pendingSms || [];
+  openModal(`<h2>📩 SMS that need an account</h2>
+    <p class="muted" style="font-size:13px">I couldn't tell which account these belong to. Pick one and the app will remember those account/card digits, so next time it's automatic.</p>
+    ${P.length ? `<div class="tbl-wrap" style="max-height:55vh;overflow:auto"><table>${P.map((t, n) => `<tr><td style="width:55%"><div><b class="${isXfer(t) ? 'xf' : t.dir === 'in' ? 'in' : 'out'}">${t.dir === 'in' ? '+' : '−'}${fmt(t.amount)}</b> · ${niceDate(t.date)}</div><div class="muted" style="font-size:12px">${esc(t.desc)}${t._digits ? ` · ends ${esc(t._digits)}` : ''}</div></td>
+      <td><select class="pacc" data-n="${n}" style="width:100%"><option value="">Decide later</option><option value="__ignore">Ignore (not a real payment)</option>${S.accounts.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select></td></tr>`).join('')}</table></div>` : '<div class="empty">Nothing to review 🎉</div>'}
+    <div class="actions"><button class="btn" onclick="closeModal()">Close</button>${P.length ? '<button class="btn pri" onclick="savePending()">Save</button>' : ''}</div>`);
+}
+function savePending() {
+  const keep = []; let n = 0;
+  S.pendingSms.forEach((t, i) => {
+    const sel = document.querySelector(`.pacc[data-n="${i}"]`).value;
+    if (sel === '__ignore') return;
+    if (!sel) { keep.push(t); return; }
+    const a = acct(sel);
+    if (t._digits && !a.last4) a.last4 = t._digits;
+    S.txns.push({id: uid(), created: Date.now() + i, ...stripTmp(t), accountId: sel, src: 'sms'}); n++;
+  });
+  // the newly learned digits may resolve other waiting SMS too
+  S.pendingSms = keep.filter(t => {
+    const a = t._digits && S.accounts.find(a => a.last4 && (a.last4.endsWith(t._digits) || t._digits.endsWith(a.last4)));
+    if (!a) return true;
+    S.txns.push({id: uid(), created: Date.now(), ...stripTmp(t), accountId: a.id, src: 'sms'}); n++;
+    return false;
+  });
+  save(); closeModal(); render(); toast(`Added ${n}`);
+}
+function smsSettingsCard() {
+  if (!NATIVE) return `<div class="card"><h2>📩 Automatic SMS reading</h2><p class="muted" style="font-size:13px">Available in the Android app: it reads your bank SMS by itself, so every GPay/UPI/card payment shows up without you doing anything.</p>
+    <a class="btn" href="https://github.com/SarthakVerma18/money-tracker/releases/latest/download/money-tracker.apk">⬇️ Get the Android app (.apk)</a></div>`;
+  const P = (S.pendingSms || []).length;
+  return `<div class="card"><h2>📩 Automatic SMS reading</h2>
+    ${S.smsAuto ? `<p><span class="in">● On</span> — new bank SMS are added each time you open the app.${S.smsChecked ? ` <span class="muted">Last checked ${new Date(S.smsChecked).toLocaleString('en-IN', {dateStyle: 'medium', timeStyle: 'short'})}.</span>` : ''}</p>
+      ${P ? `<p class="warn">${P} SMS need an account. <button class="link" onclick="openPending()">Review</button></p>` : ''}
+      <div class="filters"><button class="btn" onclick="syncSms(false)">Check now</button><button class="btn" onclick="S.smsAuto=false;save();render()">Turn off</button></div>`
+    : `<p class="muted" style="font-size:13px">Reads debit/credit SMS from your banks and card companies (skips OTPs, promos and personal messages) and adds them as transactions. SMS never leave your phone.</p>
+      <button class="btn pri" onclick="enableSms()">Turn on</button>`}
+    <p class="muted" style="font-size:12px;margin-bottom:0">For SMS to land in the right account, add the last 4 digits of each account/card under Accounts.</p></div>`;
 }
 
 /* Transfer finder: same amount, opposite direction, different own accounts, within 4 days */
@@ -1128,6 +1227,7 @@ function vSettings() {
       <td style="white-space:nowrap"><button class="btn sm" ${i ? '' : 'disabled'} onclick="[S.rules[${i - 1}],S.rules[${i}]]=[S.rules[${i}],S.rules[${i - 1}]];save();render()">↑</button> <button class="btn sm danger" onclick="S.rules.splice(${i},1);save();render()">✕</button></td></tr>`).join('')}
     </table></div></div>
   <div>
+  ${smsSettingsCard()}
   <div class="card"><h2>Categories</h2>
     ${['expense', 'income'].map(k => `<p style="margin:8px 0 4px"><b>${k === 'expense' ? 'Expense' : 'Income'}</b></p><div style="display:flex;flex-wrap:wrap;gap:6px">${S.categories[k].map((c, i) => `<span class="pill" style="font-size:12px;padding:3px 8px"><span class="dot" style="background:${catColor(c)}"></span>${esc(c)} <button class="link" title="Rename" onclick="renameCat('${k}',${i})">✎</button> <button class="link" style="color:var(--out)" title="Remove" onclick="delCat('${k}',${i})">✕</button></span>`).join('')}
       <button class="btn sm" onclick="addCat('${k}')">＋ Add</button></div>`).join('')}
@@ -1159,6 +1259,7 @@ function delCat(k, i) {
   save(); render();
 }
 function download(name, text, type) {
+  if (NATIVE) { toast(Android.saveFile(name, text, type)); return; }
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], {type})); a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
@@ -1187,17 +1288,24 @@ function wipe() {
 render();
 
 /* ================= App install / offline / Android share ================= */
-if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
+if (!NATIVE && 'serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
+// Android app hooks
+window.__back = () => {   // returns true if the app handled the back button
+  if (!$('#modal').classList.contains('hidden')) { closeModal(); return true; }
+  if (ui.view !== 'dashboard') { go('dashboard'); return true; }
+  return false;
+};
+window.onAppResume = () => syncSms(true);
+if (NATIVE) setTimeout(() => syncSms(true), 300);
 if (navigator.storage?.persist) navigator.storage.persist();   // ask the browser not to clear our data under storage pressure
+window.handleShared = shared => { const t = parseSms(shared); if (t) openTxn(null, t); else openSms(shared); };
 (() => {
   const p = new URLSearchParams(location.search);
   const shared = [p.get('share_title'), p.get('share_text')].filter(Boolean).join('\n');
   const action = p.get('action');
   if (shared || action) history.replaceState(null, '', location.pathname);
-  if (shared) {
-    const t = parseSms(shared);
-    if (t) openTxn(null, t); else openSms(shared);
-  } else if (action === 'add') openTxn();
+  if (shared) handleShared(shared);
+  else if (action === 'add') openTxn();
   else if (action === 'sms') openSms();
 })();
 </script>
